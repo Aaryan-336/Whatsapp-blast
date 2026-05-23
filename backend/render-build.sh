@@ -7,4 +7,4 @@ npm install
 
 # Download Chromium binary for Puppeteer on Render
 echo "Downloading Chrome binary for Puppeteer..."
-npx puppeteer browsers install chrome
+npx puppeteer browsers install
