@@ -1,0 +1,41 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Production build outputs
+dist/
+dist-ssr/
+build/
+
+# Local configuration and environment secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# SQLite local database
+backend/database.sqlite
+
+# Multer uploads directory
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# WhatsApp session session tokens and QR cache
+backend/whatsapp-session/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# IDE configuration files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

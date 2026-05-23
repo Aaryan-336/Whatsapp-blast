@@ -1,0 +1,10 @@
+{
+  "ignore": [
+    "database.sqlite",
+    "database.sqlite-journal",
+    "whatsapp-session/**",
+    "uploads/**",
+    "*.log"
+  ],
+  "delay": "1.5"
+}
