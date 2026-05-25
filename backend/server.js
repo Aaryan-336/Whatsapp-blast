@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const csvParser = require('csv-parser');
 const xlsx = require('xlsx');
+const axios = require('axios');
 const { Sequelize } = require('sequelize');
 
 const {
@@ -585,7 +586,9 @@ app.post('/api/contacts/parse', upload.single('file'), async (req, res) => {
   try {
     if (ext === '.csv') {
       const { Readable } = require('stream');
-      const csvStream = Readable.from([req.file.buffer.toString('utf-8')]);
+      // Strip BOM and normalize line endings
+      let csvText = req.file.buffer.toString('utf-8').replace(/^\uFEFF/, '');
+      const csvStream = Readable.from([csvText]);
 
       await new Promise((resolve, reject) => {
         csvStream
@@ -595,18 +598,18 @@ app.post('/api/contacts/parse', upload.single('file'), async (req, res) => {
               const norm = {};
               Object.keys(row).forEach(k => {
                 const cleanKey = k.replace(/^\ufeff/, '').toLowerCase().trim();
-                norm[cleanKey] = row[k];
+                norm[cleanKey] = (row[k] || '').toString().trim();
               });
-              const phone = norm.phone || norm.number || norm.contact || '';
-              if (phone) {
+              const phone = norm.phone || norm.number || norm.contact || norm.mobile || norm.cell || '';
+              if (phone && phone.replace(/\D/g, '').length >= 7) {
                 contactsList.push({
-                  name: norm.name || norm.firstname || '',
-                  phone: phone.toString().replace(/\D/g, ''),
-                  notes: norm.notes || norm.custom1 || ''
+                  name: norm.name || norm.firstname || norm['first name'] || norm.fullname || '',
+                  phone: phone.replace(/\D/g, ''),
+                  notes: norm.notes || norm.custom1 || norm.remark || norm.remarks || ''
                 });
               }
-            } catch (err) {
-              reject(err);
+            } catch (rowErr) {
+              // Skip malformed rows
             }
           })
           .on('end', resolve)
@@ -621,14 +624,14 @@ app.post('/api/contacts/parse', upload.single('file'), async (req, res) => {
         const norm = {};
         Object.keys(row).forEach(k => {
           const cleanKey = k.replace(/^\ufeff/, '').toLowerCase().trim();
-          norm[cleanKey] = row[k];
+          norm[cleanKey] = (row[k] || '').toString().trim();
         });
-        const phone = norm.phone || norm.number || norm.contact || '';
-        if (phone) {
+        const phone = norm.phone || norm.number || norm.contact || norm.mobile || norm.cell || '';
+        if (phone && phone.replace(/\D/g, '').length >= 7) {
           contactsList.push({
-            name: norm.name || norm.firstname || '',
-            phone: phone.toString().replace(/\D/g, ''),
-            notes: norm.notes || norm.custom1 || ''
+            name: norm.name || norm.firstname || norm['first name'] || norm.fullname || '',
+            phone: phone.replace(/\D/g, ''),
+            notes: norm.notes || norm.custom1 || norm.remark || norm.remarks || ''
           });
         }
       });
@@ -637,7 +640,79 @@ app.post('/api/contacts/parse', upload.single('file'), async (req, res) => {
       res.status(400).json({ error: 'Only CSV/Excel formats supported.' });
     }
   } catch (err) {
+    console.error('File parse error:', err);
     res.status(500).json({ error: err.message || 'Error processing file.' });
+  }
+});
+
+// Google Sheets URL Parser
+app.post('/api/contacts/parse-gsheet', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'Google Sheets URL is required.' });
+
+  try {
+    // Extract sheet ID from various Google Sheets URL formats
+    let sheetId = null;
+    const patterns = [
+      /\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/,
+      /\/d\/([a-zA-Z0-9-_]+)/,
+      /key=([a-zA-Z0-9-_]+)/
+    ];
+    for (const pattern of patterns) {
+      const match = url.match(pattern);
+      if (match) { sheetId = match[1]; break; }
+    }
+
+    if (!sheetId) {
+      return res.status(400).json({ error: 'Could not extract Google Sheet ID from URL. Make sure the sheet is set to "Anyone with the link can view".' });
+    }
+
+    const csvUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv`;
+    const response = await axios.get(csvUrl, { 
+      timeout: 15000,
+      responseType: 'text',
+      maxRedirects: 5,
+      validateStatus: (status) => status < 400
+    });
+
+    const csvText = response.data.replace(/^\uFEFF/, '');
+    const { Readable } = require('stream');
+    const csvStream = Readable.from([csvText]);
+    const contactsList = [];
+
+    await new Promise((resolve, reject) => {
+      csvStream
+        .pipe(csvParser())
+        .on('data', (row) => {
+          try {
+            const norm = {};
+            Object.keys(row).forEach(k => {
+              const cleanKey = k.replace(/^\ufeff/, '').toLowerCase().trim();
+              norm[cleanKey] = (row[k] || '').toString().trim();
+            });
+            const phone = norm.phone || norm.number || norm.contact || norm.mobile || norm.cell || '';
+            if (phone && phone.replace(/\D/g, '').length >= 7) {
+              contactsList.push({
+                name: norm.name || norm.firstname || norm['first name'] || norm.fullname || '',
+                phone: phone.replace(/\D/g, ''),
+                notes: norm.notes || norm.custom1 || norm.remark || norm.remarks || ''
+              });
+            }
+          } catch (rowErr) {
+            // Skip malformed rows
+          }
+        })
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    res.json({ contacts: contactsList });
+  } catch (err) {
+    console.error('Google Sheets parse error:', err.message);
+    if (err.response && err.response.status === 404) {
+      return res.status(400).json({ error: 'Sheet not found. Make sure sharing is set to "Anyone with the link".'})
+    }
+    res.status(500).json({ error: err.message || 'Failed to fetch Google Sheet. Make sure sharing is enabled.' });
   }
 });
 

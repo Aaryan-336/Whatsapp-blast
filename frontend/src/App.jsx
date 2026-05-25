@@ -98,6 +98,11 @@ export default function App() {
   const fileInputRef = useRef(null);
   const socketRef = useRef(null);
 
+  const [isUploading, setIsUploading] = useState(false);
+  const [isSavingCampaign, setIsSavingCampaign] = useState(false);
+  const [gsheetUrl, setGsheetUrl] = useState('');
+  const [isLoadingGsheet, setIsLoadingGsheet] = useState(false);
+
   const showToast = (text, type = 'success') => {
     setToast({ text, type });
     setTimeout(() => setToast(null), 4000);
@@ -217,23 +222,56 @@ export default function App() {
   const handleCSVUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    setIsUploading(true);
     const formData = new FormData();
     formData.append('file', file);
 
     try {
       const res = await axios.post(`${API_BASE}/api/contacts/parse`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 30000
       });
       const parsed = res.data.contacts;
-      setNewCampaign(prev => ({
-        ...prev,
-        contacts: [...prev.contacts, ...parsed]
-      }));
-      showToast(`Successfully parsed ${parsed.length} contacts.`, 'success');
+      if (parsed.length === 0) {
+        showToast('No valid contacts found. Make sure your file has columns: name, phone', 'warning');
+      } else {
+        setNewCampaign(prev => ({
+          ...prev,
+          contacts: [...prev.contacts, ...parsed]
+        }));
+        showToast(`Successfully parsed ${parsed.length} contacts from file.`, 'success');
+      }
     } catch (err) {
-      showToast(err.response?.data?.error || 'CSV parsing failed.', 'error');
+      const msg = err.response?.data?.error || err.message || 'File upload failed.';
+      showToast(`Upload error: ${msg}`, 'error');
     } finally {
+      setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  // Google Sheets URL Parser
+  const handleGoogleSheetImport = async () => {
+    if (!gsheetUrl.trim()) return showToast('Please paste a Google Sheets URL.', 'error');
+    setIsLoadingGsheet(true);
+    try {
+      const res = await axios.post(`${API_BASE}/api/contacts/parse-gsheet`, { url: gsheetUrl }, { timeout: 30000 });
+      const parsed = res.data.contacts;
+      if (parsed.length === 0) {
+        showToast('No valid contacts found in sheet. Make sure it has columns: name, phone', 'warning');
+      } else {
+        setNewCampaign(prev => ({
+          ...prev,
+          contacts: [...prev.contacts, ...parsed]
+        }));
+        showToast(`Imported ${parsed.length} contacts from Google Sheet.`, 'success');
+        setGsheetUrl('');
+      }
+    } catch (err) {
+      const msg = err.response?.data?.error || err.message || 'Google Sheets import failed.';
+      showToast(`Sheet error: ${msg}`, 'error');
+    } finally {
+      setIsLoadingGsheet(false);
     }
   };
 
@@ -304,6 +342,7 @@ export default function App() {
     if (!newCampaign.name) return showToast('Campaign name is required.', 'error');
     if (newCampaign.contacts.length === 0) return showToast('Please load at least 1 contact.', 'error');
 
+    setIsSavingCampaign(true);
     try {
       await axios.post(`${API_BASE}/api/campaigns`, newCampaign);
       showToast('Campaign successfully prepared!', 'success');
@@ -330,7 +369,9 @@ export default function App() {
       });
       loadCampaigns();
     } catch (err) {
-      showToast('Failed to create campaign.', 'error');
+      showToast('Failed to create campaign: ' + (err.response?.data?.error || err.message), 'error');
+    } finally {
+      setIsSavingCampaign(false);
     }
   };
 
@@ -1385,27 +1426,76 @@ export default function App() {
                 <div className="border-t border-darkBorder/60 pt-6 space-y-4">
                   <h4 className="text-xs font-bold text-white uppercase tracking-wider">Load Campaign Contacts List</h4>
                   
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {/* CSV/Excel Upload */}
                     <div>
-                      <label className="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Upload Excel / CSV list</label>
-                      <div className="border-2 border-dashed border-darkBorder hover:border-primary-500/30 rounded-2xl p-6 text-center cursor-pointer relative bg-darkBg/10">
-                        <Upload className="w-8 h-8 text-gray-500 mx-auto mb-2" />
-                        <span className="text-xs font-bold text-gray-300">Click to Select CSV File</span>
-                        <p className="text-[10px] text-gray-600 mt-1">Required columns: name, phone, notes</p>
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Upload Excel / CSV</label>
+                      <div className={`border-2 border-dashed rounded-2xl p-5 text-center cursor-pointer relative transition-all duration-300 ${
+                        isUploading 
+                          ? 'border-primary-500 bg-primary-500/5 animate-pulse' 
+                          : 'border-darkBorder hover:border-primary-500/50 bg-darkBg/10 hover:bg-primary-500/5'
+                      }`}>
+                        {isUploading ? (
+                          <>
+                            <RefreshCw className="w-7 h-7 text-primary-400 mx-auto mb-2 animate-spin" />
+                            <span className="text-xs font-bold text-primary-400">Parsing file...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Upload className="w-7 h-7 text-gray-500 mx-auto mb-2" />
+                            <span className="text-xs font-bold text-gray-300">Click to Upload</span>
+                            <p className="text-[9px] text-gray-600 mt-1">CSV, XLSX, XLS</p>
+                          </>
+                        )}
                         <input 
                           type="file" 
                           ref={fileInputRef}
                           onChange={handleCSVUpload}
                           accept=".csv,.xlsx,.xls"
                           className="absolute inset-0 opacity-0 cursor-pointer"
+                          disabled={isUploading}
                         />
                       </div>
                     </div>
 
+                    {/* Google Sheets Import */}
                     <div>
-                      <label className="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Copy-Paste manual list (One per line)</label>
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Google Sheets Link</label>
+                      <div className="space-y-2">
+                        <input 
+                          type="url" 
+                          placeholder="Paste Google Sheets URL here..."
+                          value={gsheetUrl}
+                          onChange={(e) => setGsheetUrl(e.target.value)}
+                          className="w-full bg-darkBg border border-darkBorder focus:border-primary-500 rounded-xl px-3 py-2.5 text-xs text-white placeholder-gray-600 outline-none font-semibold"
+                        />
+                        <button 
+                          type="button" 
+                          onClick={handleGoogleSheetImport}
+                          disabled={isLoadingGsheet || !gsheetUrl.trim()}
+                          className={`w-full py-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 ${
+                            isLoadingGsheet 
+                              ? 'bg-primary-500/20 text-primary-400 border border-primary-500/30 cursor-wait' 
+                              : gsheetUrl.trim() 
+                                ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-md shadow-emerald-500/10 cursor-pointer'
+                                : 'bg-darkBg border border-darkBorder text-gray-600 cursor-not-allowed'
+                          }`}
+                        >
+                          {isLoadingGsheet ? (
+                            <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Fetching Sheet...</>
+                          ) : (
+                            <><ExternalLink className="w-3.5 h-3.5" /> Import from Sheet</>
+                          )}
+                        </button>
+                        <p className="text-[9px] text-gray-600">Sheet must be public or "Anyone with link"</p>
+                      </div>
+                    </div>
+
+                    {/* Manual Paste */}
+                    <div>
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Copy-Paste Manual List</label>
                       <textarea 
-                        placeholder="phone,name,notes&#10;e.g. 919876543210,Aary,Confirming tooth extraction"
+                        placeholder={"phone,name,notes\ne.g. 919876543210,Aary,Notes"}
                         value={manualContactInput}
                         onChange={(e) => setManualContactInput(e.target.value)}
                         rows={3}
@@ -1414,7 +1504,12 @@ export default function App() {
                       <button 
                         type="button" 
                         onClick={parseManualContactsInput}
-                        className="w-full mt-2 py-1.5 bg-darkBg border border-darkBorder hover:border-primary-500 text-primary-400 rounded-xl text-xs font-bold transition-all"
+                        disabled={!manualContactInput.trim()}
+                        className={`w-full mt-2 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                          manualContactInput.trim() 
+                            ? 'bg-darkBg border border-primary-500/40 text-primary-400 hover:bg-primary-500/10 cursor-pointer'
+                            : 'bg-darkBg border border-darkBorder text-gray-600 cursor-not-allowed'
+                        }`}
                       >
                         Parse Text Numbers
                       </button>
@@ -1447,9 +1542,22 @@ export default function App() {
 
                   <button
                     type="submit"
-                    className="px-6 py-3 bg-primary-600 hover:bg-primary-500 text-darkBg text-xs font-extrabold rounded-xl transition-all shadow-lg shadow-primary-500/15"
+                    disabled={isSavingCampaign || newCampaign.contacts.length === 0}
+                    className={`px-8 py-3 text-xs font-extrabold rounded-xl transition-all duration-300 flex items-center gap-2 ${
+                      isSavingCampaign
+                        ? 'bg-primary-500/30 text-primary-300 border border-primary-500/30 cursor-wait shadow-lg shadow-primary-500/10 animate-pulse'
+                        : newCampaign.contacts.length === 0
+                          ? 'bg-gray-800 text-gray-600 border border-darkBorder cursor-not-allowed'
+                          : 'bg-primary-600 hover:bg-primary-500 text-darkBg shadow-lg shadow-primary-500/15 hover:shadow-primary-500/25 hover:scale-[1.02] active:scale-95'
+                    }`}
                   >
-                    Save & Initialize Campaign
+                    {isSavingCampaign ? (
+                      <><RefreshCw className="w-4 h-4 animate-spin" /> Saving Campaign...</>
+                    ) : newCampaign.contacts.length === 0 ? (
+                      <><AlertCircle className="w-4 h-4" /> Load Contacts First</>
+                    ) : (
+                      <><Sparkles className="w-4 h-4" /> Save & Initialize Campaign</>
+                    )}
                   </button>
                 </div>
 
