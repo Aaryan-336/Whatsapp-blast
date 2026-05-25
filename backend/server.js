@@ -35,23 +35,8 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// Setup file uploads destination
-const uploadPath = path.resolve(__dirname, 'uploads');
-if (!fs.existsSync(uploadPath)) {
-  fs.mkdirSync(uploadPath, { recursive: true });
-}
-
-// Multer Storage Configuration
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}_${Math.round(Math.random() * 1e9)}${ext}`);
-  }
-});
-const upload = multer({ storage });
+// Setup file uploads memory storage
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Bind Socket.io with WhatsApp Manager
 whatsappManager.setSocketIO(io);
@@ -594,36 +579,50 @@ app.delete('/api/contacts/:id', async (req, res) => {
 app.post('/api/contacts/parse', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  const filePath = req.file.path;
   const ext = path.extname(req.file.originalname).toLowerCase();
   const contactsList = [];
 
   try {
     if (ext === '.csv') {
-      fs.createReadStream(filePath)
-        .pipe(csvParser())
-        .on('data', (row) => {
-          const norm = {};
-          Object.keys(row).forEach(k => norm[k.toLowerCase().trim()] = row[k]);
-          const phone = norm.phone || norm.number || norm.contact || '';
-          if (phone) {
-            contactsList.push({
-              name: norm.name || norm.firstname || '',
-              phone: phone.toString().replace(/\D/g, ''),
-              notes: norm.notes || norm.custom1 || ''
-            });
-          }
-        })
-        .on('end', () => {
-          fs.unlinkSync(filePath);
-          res.json({ contacts: contactsList });
-        });
+      const { Readable } = require('stream');
+      const csvStream = Readable.from([req.file.buffer.toString('utf-8')]);
+
+      await new Promise((resolve, reject) => {
+        csvStream
+          .pipe(csvParser())
+          .on('data', (row) => {
+            try {
+              const norm = {};
+              Object.keys(row).forEach(k => {
+                const cleanKey = k.replace(/^\ufeff/, '').toLowerCase().trim();
+                norm[cleanKey] = row[k];
+              });
+              const phone = norm.phone || norm.number || norm.contact || '';
+              if (phone) {
+                contactsList.push({
+                  name: norm.name || norm.firstname || '',
+                  phone: phone.toString().replace(/\D/g, ''),
+                  notes: norm.notes || norm.custom1 || ''
+                });
+              }
+            } catch (err) {
+              reject(err);
+            }
+          })
+          .on('end', resolve)
+          .on('error', reject);
+      });
+
+      res.json({ contacts: contactsList });
     } else if (ext === '.xlsx' || ext === '.xls') {
-      const wb = xlsx.readFile(filePath);
+      const wb = xlsx.read(req.file.buffer, { type: 'buffer' });
       const rows = xlsx.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
       rows.forEach((row) => {
         const norm = {};
-        Object.keys(row).forEach(k => norm[k.toLowerCase().trim()] = row[k]);
+        Object.keys(row).forEach(k => {
+          const cleanKey = k.replace(/^\ufeff/, '').toLowerCase().trim();
+          norm[cleanKey] = row[k];
+        });
         const phone = norm.phone || norm.number || norm.contact || '';
         if (phone) {
           contactsList.push({
@@ -633,15 +632,12 @@ app.post('/api/contacts/parse', upload.single('file'), async (req, res) => {
           });
         }
       });
-      fs.unlinkSync(filePath);
       res.json({ contacts: contactsList });
     } else {
-      fs.unlinkSync(filePath);
       res.status(400).json({ error: 'Only CSV/Excel formats supported.' });
     }
   } catch (err) {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || 'Error processing file.' });
   }
 });
 
