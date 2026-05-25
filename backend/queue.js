@@ -1,4 +1,4 @@
-const { Campaign, Contact, Blocklist, Setting } = require('./database');
+const { Campaign, Contact, Blocklist, Setting, AppointmentSlot, MessageLog } = require('./database');
 const whatsappManager = require('./whatsapp');
 
 class CampaignQueue {
@@ -25,6 +25,12 @@ class CampaignQueue {
 
     await this.resetDailyLimitsIfNeeded();
     
+    // Check if system is in Manual Mode
+    const sendingMode = await Setting.findOne({ where: { key: 'sendingMode' } });
+    if (sendingMode && sendingMode.value === 'Manual') {
+      throw new Error('System is in Manual Mode. Campaigns cannot be automated in Manual Mode.');
+    }
+
     const campaign = await Campaign.findByPk(campaignId);
     if (!campaign) throw new Error('Campaign not found');
 
@@ -76,6 +82,17 @@ class CampaignQueue {
         return;
       }
 
+      // Check system-wide sending mode double check
+      const sendingMode = await Setting.findOne({ where: { key: 'sendingMode' } });
+      if (sendingMode && sendingMode.value === 'Manual') {
+        console.log('Sending mode changed to Manual. Pausing queue.');
+        campaign.status = 'paused';
+        await campaign.save();
+        io.emit('campaign-status-changed', { campaignId, status: 'paused', reason: 'Mode changed to Manual' });
+        this.activeCampaigns.delete(campaignId);
+        return;
+      }
+
       // Check daily safety thresholds
       const dailySentSetting = await Setting.findOne({ where: { key: 'dailySentCount' } });
       const dailyLimitVal = parseInt(campaign.dailyLimit || '200', 10);
@@ -91,20 +108,9 @@ class CampaignQueue {
         return;
       }
 
-      // Check if WhatsApp is connected
-      if (whatsappManager.status !== 'Connected') {
-        console.log('WhatsApp is not connected. Pausing campaign queue.');
-        campaign.status = 'paused';
-        await campaign.save();
-        io.emit('campaign-status-changed', { campaignId, status: 'paused', reason: 'WhatsApp Disconnected' });
-        io.emit('toast-message', { type: 'error', text: 'WhatsApp disconnected! Campaign paused.' });
-        this.activeCampaigns.delete(campaignId);
-        return;
-      }
-
       // Pick the next pending contact
       const contact = await Contact.findOne({
-        where: { campaignId, status: 'pending' },
+        where: { campaignId, messageStatus: 'pending', optIn: true },
         order: [['id', 'ASC']]
       });
 
@@ -118,32 +124,11 @@ class CampaignQueue {
         return;
       }
 
-      // Guardrail Check: Automatic pause if safety limit of errors is triggered
-      const totalContactsCount = await Contact.count({ where: { campaignId } });
-      const failedContactsCount = await Contact.count({ where: { campaignId, status: 'failed' } });
-      
-      // Stop/pause if failure rate > 20% (only if we have processed at least 5 contacts)
-      const processedCount = await Contact.count({
-        where: { campaignId, status: ['sent', 'failed'] }
-      });
-
-      if (processedCount >= 5) {
-        const failureRate = (failedContactsCount / processedCount) * 100;
-        if (failureRate > 20) {
-          campaign.status = 'paused';
-          await campaign.save();
-          io.emit('campaign-status-changed', { campaignId, status: 'paused', reason: 'High Failure Rate' });
-          io.emit('toast-message', { type: 'error', text: 'Abnormally high error rate (>20%). Queue paused to protect your WhatsApp account.' });
-          this.activeCampaigns.delete(campaignId);
-          return;
-        }
-      }
-
       // Guardrail Check: Blocklist Check
       const blocked = await Blocklist.findOne({ where: { phone: contact.phone } });
       if (blocked) {
-        contact.status = 'excluded';
-        contact.error = 'Phone number is in blocklist/unsubscribed';
+        contact.messageStatus = 'failed';
+        contact.notes = (contact.notes || '') + '\nExcluded: Number in opt-out blocklist.';
         await contact.save();
         io.emit('log-added', { contact });
         
@@ -152,58 +137,97 @@ class CampaignQueue {
         return;
       }
 
-      // Compile and personalize campaign message
-      let text = campaign.messageTemplate;
-      text = text.replace(/{name}/g, contact.name || '');
-      text = text.replace(/{phone}/g, contact.phone || '');
-      text = text.replace(/{custom1}/g, contact.custom1 || '');
-      text = text.replace(/{custom2}/g, contact.custom2 || '');
+      // Resolve business nickname
+      const bizNameSetting = await Setting.findOne({ where: { key: 'businessName' } });
+      const businessName = bizNameSetting?.value || 'Our Business';
 
-      let attachmentInfo = null;
-      if (campaign.attachmentPath) {
-        attachmentInfo = {
-          path: campaign.attachmentPath,
-          name: campaign.attachmentName,
-          mimeType: campaign.attachmentMimeType
+      // Resolve date/time if there's an appointment slot
+      let appointmentDate = '';
+      let appointmentTime = '';
+      if (contact.appointmentSlotId) {
+        const slot = await AppointmentSlot.findByPk(contact.appointmentSlotId);
+        if (slot) {
+          appointmentDate = slot.date;
+          appointmentTime = slot.time;
+        }
+      }
+
+      // Compile and personalize campaign message text
+      let text = campaign.messageTemplate;
+      text = text.replace(/{{name}}/g, contact.name || '');
+      text = text.replace(/{{phone}}/g, contact.phone || '');
+      text = text.replace(/{{businessName}}/g, businessName);
+      text = text.replace(/{{campaignName}}/g, campaign.name || '');
+      text = text.replace(/{{date}}/g, appointmentDate);
+      text = text.replace(/{{time}}/g, appointmentTime);
+
+      // Map template variables for Meta Cloud API template messages if configured
+      let campaignTemplateConfig = null;
+      if (campaign.useTemplate && campaign.templateName) {
+        // Extract variables in order of appearance
+        const regex = /{{[a-zA-Z0-9_]+}}/g;
+        const matches = campaign.messageTemplate.match(regex) || [];
+        const parameters = matches.map(match => {
+          const varName = match.replace(/[{}]/g, '');
+          let val = '';
+          if (varName === 'name') val = contact.name || '';
+          else if (varName === 'phone') val = contact.phone || '';
+          else if (varName === 'businessName') val = businessName;
+          else if (varName === 'campaignName') val = campaign.name || '';
+          else if (varName === 'date') val = appointmentDate;
+          else if (varName === 'time') val = appointmentTime;
+          return { type: 'text', text: val };
+        });
+
+        campaignTemplateConfig = {
+          useTemplate: true,
+          templateName: campaign.templateName,
+          templateLanguage: campaign.templateLanguage || 'en',
+          parameters
         };
       }
 
       try {
-        await whatsappManager.sendMessage(contact.phone, text, attachmentInfo);
+        // Mark contact as queued while dispatching
+        contact.messageStatus = 'queued';
+        await contact.save();
+
+        const result = await whatsappManager.sendMessage(contact.phone, text, campaignTemplateConfig);
         
         // Success
-        contact.status = 'sent';
-        contact.sentAt = new Date();
+        contact.messageStatus = 'sent';
+        contact.metaMessageId = result.messageId || null;
         await contact.save();
 
         // Increment daily count setting
         const updatedSent = currentlySent + 1;
         await Setting.update({ value: String(updatedSent) }, { where: { key: 'dailySentCount' } });
         
+        // Log outgoing message in history
+        await MessageLog.create({
+          contactId: contact.id,
+          direction: 'outgoing',
+          messageText: text
+        });
+
         io.emit('log-added', { contact });
         io.emit('campaign-progress', {
           campaignId,
-          sent: await Contact.count({ where: { campaignId, status: 'sent' } }),
-          failed: await Contact.count({ where: { campaignId, status: 'failed' } }),
-          pending: await Contact.count({ where: { campaignId, status: 'pending' } })
+          sent: await Contact.count({ where: { campaignId, messageStatus: 'sent' } }),
+          failed: await Contact.count({ where: { campaignId, messageStatus: 'failed' } }),
+          pending: await Contact.count({ where: { campaignId, messageStatus: 'pending' } })
         });
       } catch (err) {
-        // Classify error type
-        if (err.message === "Number not registered on WhatsApp") {
-          contact.status = 'excluded';
-          contact.error = 'Number not registered on WhatsApp';
-        } else {
-          contact.status = 'failed';
-          contact.error = err.message || 'Unknown error occurred';
-        }
+        contact.messageStatus = 'failed';
+        contact.notes = (contact.notes || '') + `\nSend failed: ${err.message}`;
         await contact.save();
 
         io.emit('log-added', { contact });
         io.emit('campaign-progress', {
           campaignId,
-          sent: await Contact.count({ where: { campaignId, status: 'sent' } }),
-          failed: await Contact.count({ where: { campaignId, status: 'failed' } }),
-          pending: await Contact.count({ where: { campaignId, status: 'pending' } })
+          sent: await Contact.count({ where: { campaignId, messageStatus: 'sent' } }),
+          failed: await Contact.count({ where: { campaignId, messageStatus: 'failed' } }),
+          pending: await Contact.count({ where: { campaignId, messageStatus: 'pending' } })
         });
       }
 
