@@ -48,7 +48,7 @@ class WhatsAppManager {
   }
 
   // Send message using Meta Cloud API
-  async sendMessage(rawPhone, text, campaignTemplateConfig = null) {
+  async sendMessage(rawPhone, text, campaignTemplateConfig = null, buttons = null) {
     const creds = await this.getCredentials();
     
     if (creds.sendingMode === 'Manual') {
@@ -99,6 +99,29 @@ class WhatsAppManager {
           }
         ];
       }
+    } else if (buttons && Array.isArray(buttons) && buttons.length > 0) {
+      // Send Interactive Message with native Reply Buttons (max 3 allowed by Meta)
+      data = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: phone,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: {
+            text: text
+          },
+          action: {
+            buttons: buttons.slice(0, 3).map((btn, idx) => ({
+              type: 'reply',
+              reply: {
+                id: btn.id || `btn_${idx}`,
+                title: String(btn.title).slice(0, 20)
+              }
+            }))
+          }
+        }
+      };
     } else {
       // Send Text Message (as fallback / draft mode)
       data = {

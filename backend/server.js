@@ -133,7 +133,17 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
     if (changes.messages && changes.messages.length > 0) {
       for (const msg of changes.messages) {
         const fromPhoneRaw = msg.from; // e.g. "919876543210"
-        const msgText = msg.text?.body?.trim();
+        let msgText = '';
+        
+        // Handle native WhatsApp interactive reply buttons and click types
+        if (msg.type === 'interactive' && msg.interactive?.button_reply) {
+          msgText = msg.interactive.button_reply.title || msg.interactive.button_reply.id || '';
+        } else if (msg.type === 'button' && msg.button) {
+          msgText = msg.button.text || msg.button.payload || '';
+        } else {
+          msgText = msg.text?.body?.trim() || '';
+        }
+        
         if (!msgText) continue;
 
         const fromPhone = fromPhoneRaw.replace(/\D/g, '');
@@ -183,6 +193,13 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
             defaults: { reason: 'Opted out via STOP keyword' }
           });
 
+          // Send confirmation back on WhatsApp
+          try {
+            await whatsappManager.sendMessage(contact.phone, `You have been opted out of all future messages. Reply START to opt back in.`);
+          } catch (e) {
+            console.error('Error sending opt-out confirmation:', e.message);
+          }
+
           io.emit('log-added', { contact });
           continue;
         }
@@ -203,6 +220,8 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
         }
 
         contact.messageStatus = 'replied';
+        let autoReplyText = '';
+        
         if (matched) {
           contact.selectedReply = matched.value;
           contact.notes = (contact.notes || '') + `\nMatched Reply: ${matched.value}`;
@@ -232,22 +251,44 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
                 notes: 'Auto-booked via incoming WhatsApp reply matching'
               });
               contact.notes = (contact.notes || '') + `\nAuto-booked slot ${slot.date} ${slot.time}`;
+              autoReplyText = `Thank you! Your appointment has been booked for ${slot.date} at ${slot.time}. We look forward to seeing you!`;
             } else {
               contact.notes = (contact.notes || '') + '\nRequested booking but no capacity slots available.';
+              autoReplyText = `Thank you for your response! We've received your booking request and our team will contact you shortly to confirm your slot.`;
             }
+          } else if (matched.action === 'Mark reschedule needed') {
+            contact.callStatus = 'reschedule_needed';
+            autoReplyText = `We have received your request to reschedule. Our team will contact you shortly to pick a new date and time.`;
           } else if (matched.action === 'Mark not interested') {
             contact.callStatus = 'not_interested';
+            autoReplyText = `No problem! We've updated our records and will not send any further campaign messages.`;
           } else if (matched.action === 'Mark follow-up needed' || matched.action === 'Mark talk to human') {
             contact.callStatus = 'pending';
             contact.notes = (contact.notes || '') + '\nFollow-up requested.';
-          } else if (matched.action === 'Mark reschedule needed') {
-            contact.callStatus = 'reschedule_needed';
+            autoReplyText = `Connecting you to our team. A representative will message you shortly!`;
           }
         } else {
           contact.notes = (contact.notes || '') + `\nIncoming message: "${msgText}"`;
+          autoReplyText = `Thank you for your message! Our team has been notified and will get back to you as soon as possible.`;
         }
 
         await contact.save();
+
+        // Send out automated reply on WhatsApp
+        if (autoReplyText) {
+          try {
+            await whatsappManager.sendMessage(contact.phone, autoReplyText);
+            // Log the outgoing auto-reply
+            await MessageLog.create({
+              contactId: contact.id,
+              direction: 'outgoing',
+              messageText: autoReplyText
+            });
+          } catch (sendErr) {
+            console.error('Error sending webhook automated reply:', sendErr.message);
+          }
+        }
+
         io.emit('log-added', { contact });
         io.emit('toast-message', { type: 'success', text: `New reply from ${contact.name || contact.phone}: "${msgText.slice(0, 30)}"` });
       }

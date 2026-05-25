@@ -1,4 +1,4 @@
-const { Campaign, Contact, Blocklist, Setting, AppointmentSlot, MessageLog } = require('./database');
+const { Campaign, Contact, Blocklist, Setting, AppointmentSlot, MessageLog, PresetReply } = require('./database');
 const whatsappManager = require('./whatsapp');
 
 class CampaignQueue {
@@ -185,6 +185,16 @@ class CampaignQueue {
           templateLanguage: campaign.templateLanguage || 'en',
           parameters
         };
+      // Fetch Preset Replies to use as interactive buttons (if not sending a Meta template)
+      let buttons = null;
+      if (!campaignTemplateConfig) {
+        const prList = await PresetReply.findAll({ where: { campaignId } });
+        if (prList && prList.length > 0) {
+          buttons = prList.slice(0, 3).map(pr => ({
+            id: `pr_${pr.id}`,
+            title: pr.value
+          }));
+        }
       }
 
       try {
@@ -192,7 +202,7 @@ class CampaignQueue {
         contact.messageStatus = 'queued';
         await contact.save();
 
-        const result = await whatsappManager.sendMessage(contact.phone, text, campaignTemplateConfig);
+        const result = await whatsappManager.sendMessage(contact.phone, text, campaignTemplateConfig, buttons);
         
         // Success
         contact.messageStatus = 'sent';
