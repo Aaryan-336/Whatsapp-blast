@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: whatsapp-campaign-backend
+    env: node
+    plan: free # Free tier is the default
+    rootDir: backend
+    buildCommand: ./render-build.sh
+    startCommand: node server.js
+    envVars:
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/.cache/puppeteer
+      - key: PORT
+        value: 5001
+      - key: DATABASE_URL
+        value: sqlite://database.sqlite
+      - key: SESSION_PATH
+        value: ./whatsapp-session
+      - key: UPLOAD_PATH
+        value: ./uploads
+      - key: MIN_COOLDOWN_SECONDS
+        value: "5"
+      - key: DEFAULT_DAILY_LIMIT
+        value: "200"
+      - key: CORS_ORIGIN
+        value: "*" # Allow all or update with Vercel frontend URL
